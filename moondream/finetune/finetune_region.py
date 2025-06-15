@@ -25,6 +25,7 @@ MODEL_PATH = ""
 LR = 1e-5
 EPOCHS = 1
 GRAD_ACCUM_STEPS = 128
+PLOT_PROGRESS = False
 
 
 def lr_schedule(step, max_steps):
@@ -129,14 +130,51 @@ def main():
         eps=1e-6,
     )
 
-    dataset = WasteDetection()
+    train_dataset = WasteDetection(split="train")
+    val_dataset = WasteDetection(split="test")
 
-    total_steps = EPOCHS * len(dataset) // GRAD_ACCUM_STEPS
+    total_steps = EPOCHS * len(train_dataset) // GRAD_ACCUM_STEPS
     pbar = tqdm(total=total_steps)
 
     i = 0
     for epoch in range(EPOCHS):
-        for sample in dataset:
+        if PLOT_PROGRESS:
+            from PIL import Image
+            from matplotlib import pyplot as plt
+            from matplotlib.patches import Rectangle
+
+            fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+
+            for i, sample in enumerate(val_dataset[:10]):
+                with torch.no_grad():
+                    enc = model.encode_image(sample["image"])
+                    img_height = sample["height"]
+                    img_width = sample["width"]
+                    objects = model.detect(enc, sample["class_names"])
+                    for obj in objects["objects"]:
+                        x_min = obj["x_min"] * img_width
+                        y_min = obj["y_min"] * img_height
+                        x_max = obj["x_max"] * img_width
+                        y_max = obj["y_max"] * img_height
+                        rect = Rectangle(
+                            (x_min, y_min),
+                            x_max - x_min,
+                            y_max - y_min,
+                            linewidth=1,
+                            edgecolor="r",
+                            facecolor="none",
+                        )
+                        ax.add_patch(rect)
+
+                ax.imshow(sample["image"])
+                ax.set_axis_off()
+                plt.tight_layout()
+                plt.savefig(f"progress_{epoch}_{i}.png")
+                plt.close()
+                # upload to wandb
+                wandb.log({"progress": wandb.Image(f"progress_{epoch}_{i}.png")})
+
+        for sample in train_dataset:
             i += 1
 
             with torch.no_grad():
@@ -173,6 +211,7 @@ def main():
                 c_idx = []
                 s_idx = []
                 for bb in boxes_list:
+                    bb = bb.to(dtype=torch.bfloat16, device=model.device)
                     l_cs = len(cs_emb)
                     cs_emb.extend(
                         [
