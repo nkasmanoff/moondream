@@ -147,22 +147,23 @@ def main():
     i = 0
     for epoch in range(EPOCHS):
         if PLOT_PROGRESS:
-
             fig, ax = plt.subplots(1, 1, figsize=(10, 10))
 
-            for i, sample in enumerate(val_dataset):
+            for sample_idx, sample in enumerate(val_dataset):
                 with torch.no_grad():
                     enc = model.encode_image(sample["image"])
-                    img_height = sample["image"].size[0]
-                    img_width = sample["image"].size[1]
+                    img_width, img_height = sample["image"].size  # PIL: (width, height)
                     if len(sample["class_names"]) == 0:
                         continue
+
                     objects = model.detect(enc, sample["class_names"][0])
                     for obj in objects["objects"]:
                         x_min = obj["x_min"] * img_width
                         y_min = obj["y_min"] * img_height
                         x_max = obj["x_max"] * img_width
                         y_max = obj["y_max"] * img_height
+
+                        # Draw bounding box
                         rect = Rectangle(
                             (x_min, y_min),
                             x_max - x_min,
@@ -172,24 +173,30 @@ def main():
                             facecolor="none",
                         )
                         ax.add_patch(rect)
-                # add text for the class name
-                ax.text(
-                    x_min,
-                    y_min,
-                    sample["class_names"][0],
-                    color="r",
-                )
+
+                        # Add class name text
+                        ax.text(
+                            x_min,
+                            y_min,
+                            sample["class_names"][0],
+                            color="r",
+                            fontsize=12,
+                            bbox=dict(
+                                facecolor="white", alpha=0.5, edgecolor="none", pad=1
+                            ),
+                        )
+
                 ax.imshow(sample["image"])
                 ax.set_axis_off()
                 plt.tight_layout()
-                plt.savefig(f"progress_{epoch}_{i}.png")
-                # upload to wandb
-                wandb.log({"progress": wandb.Image(f"progress_{epoch}_{i}.png")})
-                # reset the figure by removing the patches
-                for patch in ax.patches:
-                    patch.remove()
+                filename = f"progress_{epoch}_{sample_idx}.png"
+                plt.savefig(filename)
+                wandb.log({"progress": wandb.Image(filename)})
 
-                if i > 10:
+                # Clear the axis for the next image
+                ax.cla()
+
+                if sample_idx > 10:
                     break
 
         for sample in train_dataset:
