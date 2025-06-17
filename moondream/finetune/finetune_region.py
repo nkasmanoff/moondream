@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import math
 from safetensors.torch import save_file
 import datasets
+from PIL import Image
+from matplotlib import pyplot as plt
+from matplotlib.patches import Rectangle
 
 from tqdm import tqdm
 from bitsandbytes.optim import AdamW
@@ -21,11 +24,11 @@ from ..torch.region import (
 
 
 # This is a intended to be a basic starting point. Your optimal hyperparams and data may be different.
-MODEL_PATH = ""
+MODEL_PATH = "models/moondream_finetune.safetensors"
 LR = 1e-5
-EPOCHS = 1
+EPOCHS = 5
 GRAD_ACCUM_STEPS = 128
-PLOT_PROGRESS = False
+PLOT_PROGRESS = True
 
 
 def lr_schedule(step, max_steps):
@@ -65,12 +68,13 @@ def region_loss(
     return c_loss + s_loss
 
 
-class WasteDetection(Dataset):
-    def __init__(self, split: str = "train"):
+class ObjectDetection(Dataset):
+    def __init__(self, split: str = "train", downsample: bool = False):
         self.dataset: datasets.Dataset = datasets.load_dataset(
-            "moondream/waste_detection", split=split
+            "nkasmanoff/retail_detector_test_private", split=split
         )
         self.dataset = self.dataset.shuffle(seed=111)
+        self.downsample = downsample
 
     def __len__(self):
         return len(self.dataset)
@@ -78,6 +82,10 @@ class WasteDetection(Dataset):
     def __getitem__(self, idx):
         row = self.dataset[idx]
         image = row["image"]
+        if self.downsample:
+            # make image 1/4 size
+            image = image.resize((image.width // 2, image.height // 2))
+
         boxes = row["boxes"]
         labels = row["labels"]
 
@@ -130,8 +138,8 @@ def main():
         eps=1e-6,
     )
 
-    train_dataset = WasteDetection(split="train")
-    val_dataset = WasteDetection(split="test")
+    train_dataset = ObjectDetection(split="train")
+    val_dataset = ObjectDetection(split="train")
 
     total_steps = EPOCHS * len(train_dataset) // GRAD_ACCUM_STEPS
     pbar = tqdm(total=total_steps)
@@ -139,18 +147,17 @@ def main():
     i = 0
     for epoch in range(EPOCHS):
         if PLOT_PROGRESS:
-            from PIL import Image
-            from matplotlib import pyplot as plt
-            from matplotlib.patches import Rectangle
 
             fig, ax = plt.subplots(1, 1, figsize=(10, 10))
 
-            for i, sample in enumerate(val_dataset[:10]):
+            for i, sample in enumerate(val_dataset):
                 with torch.no_grad():
                     enc = model.encode_image(sample["image"])
-                    img_height = sample["height"]
-                    img_width = sample["width"]
-                    objects = model.detect(enc, sample["class_names"])
+                    img_height = sample["image"].size[0]
+                    img_width = sample["image"].size[1]
+                    if len(sample["class_names"]) == 0:
+                        continue
+                    objects = model.detect(enc, sample["class_names"][0])
                     for obj in objects["objects"]:
                         x_min = obj["x_min"] * img_width
                         y_min = obj["y_min"] * img_height
@@ -165,14 +172,25 @@ def main():
                             facecolor="none",
                         )
                         ax.add_patch(rect)
-
+                # add text for the class name
+                ax.text(
+                    x_min,
+                    y_min,
+                    sample["class_names"][0],
+                    color="r",
+                )
                 ax.imshow(sample["image"])
                 ax.set_axis_off()
                 plt.tight_layout()
                 plt.savefig(f"progress_{epoch}_{i}.png")
-                plt.close()
                 # upload to wandb
                 wandb.log({"progress": wandb.Image(f"progress_{epoch}_{i}.png")})
+                # reset the figure by removing the patches
+                for patch in ax.patches:
+                    patch.remove()
+
+                if i > 10:
+                    break
 
         for sample in train_dataset:
             i += 1
@@ -243,7 +261,16 @@ def main():
                     cs_labels.extend(coord_labels + s_log2_bins)
 
                 if len(cs_emb) == 0:
-                    continue
+                    bb = torch.zeros(4, device=model.device).to(dtype=torch.bfloat16)
+                    cs_emb = [
+                        encode_coordinate(bb[0].unsqueeze(0), model.region),
+                        encode_coordinate(bb[1].unsqueeze(0), model.region),
+                        encode_size(bb[2:4], model.region),
+                    ]
+                    cs_labels = [0, 0, 0, 0, 0, 0]
+                    c_idx = [0, 1, 2, 3]
+                    s_idx = [4, 5]
+
                 cs_emb = torch.stack(cs_emb)
 
                 inputs_embeds = torch.cat(
