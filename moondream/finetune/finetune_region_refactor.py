@@ -1,3 +1,18 @@
+"""
+Roadmap for updates:
+
+- Add image augmentation / label augmentation
+- Add a validation and test set
+
+- Look into why saving the model does not work
+
+- Try to implement batch processing with dataloaders
+
+- Get more data / use other sources
+- Combined datasets?
+"""
+
+import random
 import torch
 from torch.utils.data import Dataset
 import torch.nn.functional as F
@@ -28,7 +43,7 @@ from ..torch.region import (
 # This is a intended to be a basic starting point. Your optimal hyperparams and data may be different.
 MODEL_PATH = "models/moondream_base.safetensors"  # TODO: Switch to https://huggingface.co/vikhyatk/moondream2/blob/2025-01-09/model.safetensors
 # wget https://huggingface.co/vikhyatk/moondream2/resolve/2025-01-09/model.safetensors . But use starmie or default tokenizer?
-LR = 3e-4
+LR = 4e-3
 EPOCHS = 5
 GRAD_ACCUM_STEPS = 1
 PLOT_PROGRESS = True
@@ -73,16 +88,16 @@ def region_loss(
 
 
 class ObjectDetection(Dataset):
-    def __init__(self, split: str = "train", downsample: bool = True):
+    def __init__(
+        self, split: str = "train", downsample: bool = False, augment: bool = False
+    ):
         self.dataset: datasets.Dataset = datasets.load_dataset(
-            "nkasmanoff/retail_detector_test_private", split=split
+            "nkasmanoff/retail_detector", split=split
         )
-        # self.dataset = self.dataset.shuffle(seed=111)
+        self.dataset = self.dataset.shuffle(seed=420)
+        self.shuffle_labels()
         self.downsample = downsample
-        # update dataset to 1 sample
-        #        self.dataset = self.dataset.select(range(1))
-        # drop from datset where boxes is empty
-        self.dataset = self.dataset.filter(lambda x: len(x["boxes"]) > 0)
+        self.augment = augment
 
     def __len__(self):
         return len(self.dataset)
@@ -92,6 +107,49 @@ class ObjectDetection(Dataset):
         image = row["image"]
         if self.downsample:
             image = image.resize((image.width // 2, image.height // 2))
+        if self.augment:
+            # rotate image randomly between 0 and 360 degrees
+            if random.random() < 0.5:
+                angle = random.randint(0, 360)
+                image = image.rotate(angle)
+                # adjust box positions
+                # each box has coordinates (x, y, width, height) where x and y are the top left corner of the box,
+                # given as a percentage of the image width and height
+                # now adjust the box positions to rotate with the image
+                boxes = row["boxes"]
+                for box in boxes:
+                    x, y, w, h = box
+                    x = x * image.width
+                    y = y * image.height
+                    x = x * math.cos(angle) - y * math.sin(angle)
+                    y = x * math.sin(angle) + y * math.cos(angle)
+                    x = x / image.width
+                    y = y / image.height
+                    box[0] = x
+                    box[1] = y
+                    box[2] = w
+                    box[3] = h
+                row["boxes"] = boxes
+                # flip image horizontally
+            if random.random() < 0.5:
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                # adjust box positions
+                boxes = row["boxes"]
+                for box in boxes:
+                    x, y, w, h = box
+                    x = 1 - x
+                    box[0] = x
+                    box[2] = w
+            if random.random() < 0.5:
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                # adjust box positions
+                boxes = row["boxes"]
+                for box in boxes:
+                    y, x, w, h = box
+                    y = 1 - y
+                    box[1] = y
+                    box[3] = h
+                row["boxes"] = boxes
 
         boxes = row["boxes"]
         labels = row["labels"]
@@ -141,12 +199,13 @@ def main():
         model = MoondreamModel(config)
         load_weights_into_model(MODEL_PATH, model)
     else:
-        model = AutoModelForCausalLM.from_pretrained(
+        hf_model = AutoModelForCausalLM.from_pretrained(
             "vikhyatk/moondream2",
             revision="2025-01-09",
             trust_remote_code=True,  # Uncomment for GPU acceleration & pip install accelerate #
             device_map={"": "cuda"},
-        ).model
+        )
+        model = hf_model.model
 
     # If you are struggling with GPU memory, try AdamW8Bit
     optimizer = AdamW(
@@ -172,7 +231,7 @@ def main():
 
             for sample_idx, sample in enumerate(val_dataset):
                 img_width, img_height = sample["image"].size  # PIL: (width, height)
-                if len(sample["class_names"]) == 0:
+                if len(sample["class_names"]) == 0 or len(sample["boxes"]) == 0:
                     continue
 
                 with torch.no_grad():
@@ -225,11 +284,11 @@ def main():
                 # Clear the axis for the next image
                 ax.cla()
 
-                if sample_idx > 10:
+                if sample_idx > 15:
                     break
 
         for sample in train_dataset:
-            if len(sample["class_names"]) == 0:
+            if len(sample["class_names"]) == 0 or len(sample["boxes"]) == 0:
                 continue
 
             i += 1
@@ -361,7 +420,9 @@ def main():
     )
 
     if USE_HUGGINGFACE:
-        model.save_pretrained("moondream_finetune_nk_hf")
+        hf_model.save_pretrained(
+            "moondream_finetune_nk_hf"
+        )  # save this some other way...
         tokenizer = AutoTokenizer.from_pretrained(
             "vikhyatk/moondream2", revision="2025-01-09", trust_remote_code=True
         )

@@ -7,10 +7,12 @@ import datasets
 from PIL import Image
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tqdm import tqdm
 from bitsandbytes.optim import AdamW
 import wandb
+import os
 
 from ..torch.weights import load_weights_into_model
 from ..torch.moondream import MoondreamModel, MoondreamConfig, text_encoder
@@ -24,11 +26,13 @@ from ..torch.region import (
 
 
 # This is a intended to be a basic starting point. Your optimal hyperparams and data may be different.
-MODEL_PATH = "models/moondream_finetune.safetensors"
-LR = 1e-5
+MODEL_PATH = "models/moondream_base.safetensors"  # TODO: Switch to https://huggingface.co/vikhyatk/moondream2/blob/2025-01-09/model.safetensors
+# wget https://huggingface.co/vikhyatk/moondream2/resolve/2025-01-09/model.safetensors . But use starmie or default tokenizer?
+LR = 4e-3
 EPOCHS = 5
-GRAD_ACCUM_STEPS = 128
+GRAD_ACCUM_STEPS = 1
 PLOT_PROGRESS = True
+USE_HUGGINGFACE = True
 
 
 def lr_schedule(step, max_steps):
@@ -71,10 +75,20 @@ def region_loss(
 class ObjectDetection(Dataset):
     def __init__(self, split: str = "train", downsample: bool = False):
         self.dataset: datasets.Dataset = datasets.load_dataset(
-            "nkasmanoff/retail_detector_test_private", split=split
+            "nkasmanoff/retail_detector", split=split
         )
-        self.dataset = self.dataset.shuffle(seed=111)
+        self.dataset = self.dataset.shuffle(seed=420)
+        self.shuffle_labels()
         self.downsample = downsample
+
+    def shuffle_labels(self):
+        # larger dataset. Each instance is one image, one label, one box.
+        for i in range(len(self.dataset)):
+            row = self.dataset[i]
+            boxes = row["boxes"]
+            labels = row["labels"]
+            self.dataset[i]["boxes"] = boxes[torch.randperm(len(boxes))]
+            self.dataset[i]["labels"] = labels[torch.randperm(len(labels))]
 
     def __len__(self):
         return len(self.dataset)
@@ -83,7 +97,6 @@ class ObjectDetection(Dataset):
         row = self.dataset[idx]
         image = row["image"]
         if self.downsample:
-            # make image 1/4 size
             image = image.resize((image.width // 2, image.height // 2))
 
         boxes = row["boxes"]
@@ -118,17 +131,29 @@ def main():
         torch.set_default_device("mps")
 
     wandb.init(
-        project="moondream-ft",
+        project="retail-detector-ft",
         config={
             "EPOCHS": EPOCHS,
             "GRAD_ACCUM_STEPS": GRAD_ACCUM_STEPS,
             "LR": LR,
+            "MODEL_PATH": MODEL_PATH,
+            "USE_HUGGINGFACE": USE_HUGGINGFACE,
+            "PLOT_PROGRESS": PLOT_PROGRESS,
         },
     )
-
     config = MoondreamConfig()
-    model = MoondreamModel(config)
-    load_weights_into_model(MODEL_PATH, model)
+
+    if not USE_HUGGINGFACE:
+        model = MoondreamModel(config)
+        load_weights_into_model(MODEL_PATH, model)
+    else:
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            "vikhyatk/moondream2",
+            revision="2025-01-09",
+            trust_remote_code=True,  # Uncomment for GPU acceleration & pip install accelerate #
+            device_map={"": "cuda"},
+        )
+        model = hf_model.model
 
     # If you are struggling with GPU memory, try AdamW8Bit
     optimizer = AdamW(
@@ -147,16 +172,27 @@ def main():
     i = 0
     for epoch in range(EPOCHS):
         if PLOT_PROGRESS:
+            if not os.path.exists("progress"):
+                os.makedirs("progress")
+
             fig, ax = plt.subplots(1, 1, figsize=(10, 10))
 
             for sample_idx, sample in enumerate(val_dataset):
-                with torch.no_grad():
-                    enc = model.encode_image(sample["image"])
-                    img_width, img_height = sample["image"].size  # PIL: (width, height)
-                    if len(sample["class_names"]) == 0:
-                        continue
+                img_width, img_height = sample["image"].size  # PIL: (width, height)
+                if len(sample["class_names"]) == 0 or len(sample["boxes"]) == 0:
+                    continue
 
-                    objects = model.detect(enc, sample["class_names"][0])
+                with torch.no_grad():
+                    if not USE_HUGGINGFACE:
+                        enc = model.encode_image(sample["image"])
+
+                        objects = model.detect(enc, sample["class_names"][0])
+
+                    else:
+                        objects = model.detect(
+                            sample["image"], sample["class_names"][0]
+                        )
+
                     for obj in objects["objects"]:
                         x_min = obj["x_min"] * img_width
                         y_min = obj["y_min"] * img_height
@@ -190,16 +226,19 @@ def main():
                 ax.set_axis_off()
                 plt.tight_layout()
                 filename = f"progress_{epoch}_{sample_idx}.png"
-                plt.savefig(filename)
-                wandb.log({"progress": wandb.Image(filename)})
+                plt.savefig(os.path.join("progress", filename))
+                wandb.log({"progress": wandb.Image(os.path.join("progress", filename))})
 
                 # Clear the axis for the next image
                 ax.cla()
 
-                if sample_idx > 10:
+                if sample_idx > 15:
                     break
 
         for sample in train_dataset:
+            if len(sample["class_names"]) == 0 or len(sample["boxes"]) == 0:
+                continue
+
             i += 1
 
             with torch.no_grad():
@@ -236,7 +275,7 @@ def main():
                 c_idx = []
                 s_idx = []
                 for bb in boxes_list:
-                    bb = bb.to(dtype=torch.bfloat16, device=model.device)
+                    #                    bb = bb.to(dtype=torch.bfloat16, device=model.device)
                     l_cs = len(cs_emb)
                     cs_emb.extend(
                         [
@@ -325,8 +364,17 @@ def main():
     # Replace with your desired output location.
     save_file(
         model.state_dict(),
-        "moondream_finetune.safetensors",
+        "moondream_finetune_nk.safetensors",
     )
+
+    if USE_HUGGINGFACE:
+        hf_model.save_pretrained(
+            "moondream_finetune_nk_hf"
+        )  # save this some other way...
+        tokenizer = AutoTokenizer.from_pretrained(
+            "vikhyatk/moondream2", revision="2025-01-09", trust_remote_code=True
+        )
+        tokenizer.save_pretrained("moondream_finetune_nk_hf")
 
 
 if __name__ == "__main__":
