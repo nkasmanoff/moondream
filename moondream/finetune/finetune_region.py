@@ -73,7 +73,9 @@ def region_loss(
 
 
 class ObjectDetection(Dataset):
-    def __init__(self, split: str = "train", downsample: bool = False, overfit_batch: bool = True):
+    def __init__(
+        self, split: str = "train", downsample: bool = False, overfit_batch: bool = True
+    ):
         self.dataset: datasets.Dataset = datasets.load_dataset(
             "nkasmanoff/retail_detector_flattened", split=split
         )
@@ -219,12 +221,16 @@ def main():
                         y_min = obj["y_min"] * img_height
                         x_max = obj["x_max"] * img_width
                         y_max = obj["y_max"] * img_height
+                        x_center = (x_min + x_max) / 2
+                        y_center = (y_min + y_max) / 2
+                        width = x_max - x_min
+                        height = y_max - y_min
 
                         # Draw bounding box
                         rect = Rectangle(
-                            (x_min, y_min),
-                            x_max - x_min,
-                            y_max - y_min,
+                            (x_center, y_center),
+                            width,
+                            height,
                             linewidth=3,
                             edgecolor="r",
                             facecolor="none",

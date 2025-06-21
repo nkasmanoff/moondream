@@ -1,9 +1,9 @@
 """
 Roadmap for updates:
 
-- Add image augmentation / label augmentation
+- Add image augmentation / label augmentation - x
 - Add a validation and test set
-- Fine tune on vision encoder
+- Fine tune on vision encoder - x
 - Look into why saving the model does not work
 - Try to implement batch processing with dataloaders
 - Get more data / use other sources
@@ -26,6 +26,8 @@ from tqdm import tqdm
 from bitsandbytes.optim import AdamW
 import wandb
 import os
+import argparse
+from contextlib import nullcontext
 
 from ..torch.weights import load_weights_into_model
 from ..torch.moondream import MoondreamModel, MoondreamConfig, text_encoder
@@ -48,12 +50,12 @@ PLOT_PROGRESS = True
 USE_HUGGINGFACE = True
 
 
-def lr_schedule(step, max_steps):
+def lr_schedule(step, max_steps, lr):
     x = step / max_steps
     if x < 0.1:
-        return 0.1 * LR + 0.9 * LR * x / 0.1
+        return 0.1 * lr + 0.9 * lr * x / 0.1
     else:
-        return 0.1 * LR + 0.9 * LR * (1 + math.cos(math.pi * (x - 0.1))) / 2
+        return 0.1 * lr + 0.9 * lr * (1 + math.cos(math.pi * (x - 0.1))) / 2
 
 
 def region_loss(
@@ -93,7 +95,7 @@ class ObjectDetection(Dataset):
             "nkasmanoff/retail_detector", split=split
         )
         self.dataset = self.dataset.shuffle(seed=420)
-        self.shuffle_labels()
+
         self.downsample = downsample
         self.augment = augment
 
@@ -130,7 +132,7 @@ class ObjectDetection(Dataset):
                 row["boxes"] = boxes
                 # flip image horizontally
             if random.random() < 0.5:
-                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
                 # adjust box positions
                 boxes = row["boxes"]
                 for box in boxes:
@@ -139,7 +141,7 @@ class ObjectDetection(Dataset):
                     box[0] = x
                     box[2] = w
             if random.random() < 0.5:
-                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
                 # adjust box positions
                 boxes = row["boxes"]
                 for box in boxes:
@@ -174,7 +176,101 @@ class ObjectDetection(Dataset):
         }
 
 
-def main():
+def plot_progress_images(epoch, val_dataset, model, use_huggingface):
+    if not os.path.exists("progress"):
+        os.makedirs("progress")
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+
+    for sample_idx, sample in enumerate(val_dataset):
+        img_width, img_height = sample["image"].size  # PIL: (width, height)
+        if len(sample["class_names"]) == 0 or len(sample["boxes"]) == 0:
+            continue
+
+        true_objects = sample["boxes"].cpu().numpy()
+
+        with torch.no_grad():
+            if not use_huggingface:
+                enc = model.encode_image(sample["image"])
+                objects = model.detect(enc, sample["class_names"][0])
+
+            else:
+                objects = model.detect(sample["image"], sample["class_names"][0])
+
+        for obj in true_objects:
+            x = obj[0] * img_width
+            y = obj[1] * img_height
+            w = obj[2] * img_width
+            h = obj[3] * img_height
+
+            # Draw true bounding box
+            rect = Rectangle(
+                (x, y),
+                w,
+                h,
+                linewidth=1,
+                edgecolor="g",
+                facecolor="none",
+            )
+            ax.add_patch(rect)
+            # Add class name text
+            ax.text(
+                x,
+                y,
+                sample["class_names"][0],
+                color="g",
+                fontsize=12,
+                bbox=dict(facecolor="white", alpha=0.5, edgecolor="none", pad=1),
+            )
+
+        for obj in objects["objects"]:
+            x_min = obj["x_min"] * img_width
+            y_min = obj["y_min"] * img_height
+            x_max = obj["x_max"] * img_width
+            y_max = obj["y_max"] * img_height
+            x_center = (x_min + x_max) / 2
+            y_center = (y_min + y_max) / 2
+            width = x_max - x_min
+            height = y_max - y_min
+
+            # Draw bounding box
+            rect = Rectangle(
+                (x_center, y_center),
+                width,
+                height,
+                linewidth=3,
+                edgecolor="r",
+                facecolor="none",
+            )
+            ax.add_patch(rect)
+
+            # Add class name text
+            ax.text(
+                x_min,
+                y_min,
+                sample["class_names"][0],
+                color="r",
+                fontsize=12,
+                bbox=dict(facecolor="white", alpha=0.5, edgecolor="none", pad=1),
+            )
+
+        ax.imshow(sample["image"])
+        ax.set_axis_off()
+        plt.tight_layout()
+        filename = f"progress_{epoch}_{sample_idx}.png"
+        plt.savefig(os.path.join("progress", filename))
+        wandb.log({"progress": wandb.Image(os.path.join("progress", filename))})
+
+        # Clear the axis for the next image
+        ax.cla()
+
+        if sample_idx > 15:
+            break
+
+    plt.close(fig)
+
+
+def main(args):
     if torch.cuda.is_available():
         torch.set_default_device("cuda")
     elif torch.backends.mps.is_available():
@@ -183,19 +279,22 @@ def main():
     wandb.init(
         project="retail-detector-ft",
         config={
-            "EPOCHS": EPOCHS,
-            "GRAD_ACCUM_STEPS": GRAD_ACCUM_STEPS,
-            "LR": LR,
-            "MODEL_PATH": MODEL_PATH,
-            "USE_HUGGINGFACE": USE_HUGGINGFACE,
-            "PLOT_PROGRESS": PLOT_PROGRESS,
+            "EPOCHS": args.epochs,
+            "GRAD_ACCUM_STEPS": args.grad_accum_steps,
+            "LR": args.lr,
+            "MODEL_PATH": args.model_path,
+            "USE_HUGGINGFACE": args.use_huggingface,
+            "PLOT_PROGRESS": args.plot_progress,
+            "AUGMENT": args.augment,
+            "DOWNSAMPLE": args.downsample,
+            "FINETUNE_VISION_ENCODER": args.finetune_vision_encoder,
         },
     )
     config = MoondreamConfig()
 
-    if not USE_HUGGINGFACE:
+    if not args.use_huggingface:
         model = MoondreamModel(config)
-        load_weights_into_model(MODEL_PATH, model)
+        load_weights_into_model(args.model_path, model)
     else:
         hf_model = AutoModelForCausalLM.from_pretrained(
             "vikhyatk/moondream2",
@@ -206,84 +305,30 @@ def main():
         model = hf_model.model
 
     # If you are struggling with GPU memory, try AdamW8Bit
+    params_to_train = [{"params": model.region.parameters()}]
+    if args.finetune_vision_encoder:
+        params_to_train.append({"params": model.vision_encoder.parameters()})
     optimizer = AdamW(
-        [{"params": model.region.parameters()}],
-        lr=LR,
+        params_to_train,
+        lr=args.lr,
         betas=(0.9, 0.95),
         eps=1e-6,
     )
 
-    train_dataset = ObjectDetection(split="train")
-    val_dataset = ObjectDetection(split="train")
+    train_dataset = ObjectDetection(
+        split="train", augment=args.augment, downsample=args.downsample
+    )
+    val_dataset = ObjectDetection(
+        split="train", augment=False, downsample=args.downsample
+    )
 
-    total_steps = EPOCHS * len(train_dataset) // GRAD_ACCUM_STEPS
+    total_steps = args.epochs * len(train_dataset) // args.grad_accum_steps
     pbar = tqdm(total=total_steps)
 
     i = 0
-    for epoch in range(EPOCHS):
-        if PLOT_PROGRESS:
-            if not os.path.exists("progress"):
-                os.makedirs("progress")
-
-            fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-
-            for sample_idx, sample in enumerate(val_dataset):
-                img_width, img_height = sample["image"].size  # PIL: (width, height)
-                if len(sample["class_names"]) == 0 or len(sample["boxes"]) == 0:
-                    continue
-
-                with torch.no_grad():
-                    if not USE_HUGGINGFACE:
-                        enc = model.encode_image(sample["image"])
-
-                        objects = model.detect(enc, sample["class_names"][0])
-
-                    else:
-                        objects = model.detect(
-                            sample["image"], sample["class_names"][0]
-                        )
-
-                    for obj in objects["objects"]:
-                        x_min = obj["x_min"] * img_width
-                        y_min = obj["y_min"] * img_height
-                        x_max = obj["x_max"] * img_width
-                        y_max = obj["y_max"] * img_height
-
-                        # Draw bounding box
-                        rect = Rectangle(
-                            (x_min, y_min),
-                            x_max - x_min,
-                            y_max - y_min,
-                            linewidth=1,
-                            edgecolor="r",
-                            facecolor="none",
-                        )
-                        ax.add_patch(rect)
-
-                        # Add class name text
-                        ax.text(
-                            x_min,
-                            y_min,
-                            sample["class_names"][0],
-                            color="r",
-                            fontsize=12,
-                            bbox=dict(
-                                facecolor="white", alpha=0.5, edgecolor="none", pad=1
-                            ),
-                        )
-
-                ax.imshow(sample["image"])
-                ax.set_axis_off()
-                plt.tight_layout()
-                filename = f"progress_{epoch}_{sample_idx}.png"
-                plt.savefig(os.path.join("progress", filename))
-                wandb.log({"progress": wandb.Image(os.path.join("progress", filename))})
-
-                # Clear the axis for the next image
-                ax.cla()
-
-                if sample_idx > 15:
-                    break
+    for epoch in range(args.epochs):
+        if args.plot_progress:
+            plot_progress_images(epoch, val_dataset, model, args.use_huggingface)
 
         for sample in train_dataset:
             if len(sample["class_names"]) == 0 or len(sample["boxes"]) == 0:
@@ -291,8 +336,10 @@ def main():
 
             i += 1
 
-            with torch.no_grad():
+            with torch.no_grad() if not args.finetune_vision_encoder else nullcontext():
                 img_emb = model._run_vision_encoder(sample["image"])
+
+            with torch.no_grad() if not args.finetune_vision_encoder else nullcontext():
                 bos_emb = text_encoder(
                     torch.tensor(
                         [[model.config.tokenizer.bos_id]], device=model.device
@@ -312,7 +359,11 @@ def main():
 
             total_loss = 0.0
             for class_name, boxes_list in boxes_by_class.items():
-                with torch.no_grad():
+                with (
+                    torch.no_grad()
+                    if not args.finetune_vision_encoder
+                    else nullcontext()
+                ):
                     instruction = f"\n\nDetect: {class_name}\n\n"
                     instruction_tokens = model.tokenizer.encode(instruction).ids
                     instruction_emb = text_encoder(
@@ -392,15 +443,15 @@ def main():
 
             total_loss.backward()
 
-            if i % GRAD_ACCUM_STEPS == 0:
+            if i % args.grad_accum_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
 
-                lr_val = lr_schedule(i / GRAD_ACCUM_STEPS, total_steps)
+                lr_val = lr_schedule(i / args.grad_accum_steps, total_steps, args.lr)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr_val
                 pbar.set_postfix(
-                    {"step": i // GRAD_ACCUM_STEPS, "loss": total_loss.item()}
+                    {"step": i // args.grad_accum_steps, "loss": total_loss.item()}
                 )
                 pbar.update(1)
                 wandb.log(
@@ -417,7 +468,7 @@ def main():
         "moondream_finetune_nk.safetensors",
     )
 
-    if USE_HUGGINGFACE:
+    if args.use_huggingface:
         hf_model.save_pretrained(
             "moondream_finetune_nk_hf"
         )  # save this some other way...
@@ -432,4 +483,56 @@ if __name__ == "__main__":
     Replace paths with your appropriate paths.
     To run: python -m moondream.finetune.finetune_region
     """
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default="models/moondream_base.safetensors",
+        help="Path to the model safetensors file.",
+    )
+    parser.add_argument("--lr", type=float, default=4e-3, help="Learning rate.")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs.")
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps.",
+    )
+    parser.add_argument(
+        "--no-plot-progress",
+        dest="plot_progress",
+        action="store_false",
+        help="Do not plot progress images.",
+    )
+    parser.set_defaults(plot_progress=True)
+    parser.add_argument(
+        "--no-use-huggingface",
+        dest="use_huggingface",
+        action="store_false",
+        help="Do not use the Hugging Face model.",
+    )
+    parser.set_defaults(use_huggingface=True)
+
+    parser.add_argument(
+        "--finetune-vision-encoder",
+        action="store_true",
+        help="Enable finetuning of the vision encoder.",
+    )
+
+    parser.add_argument(
+        "--no-augment",
+        dest="augment",
+        action="store_false",
+        help="Disable data augmentation for the training set.",
+    )
+    parser.set_defaults(augment=True)
+    parser.add_argument(
+        "--no-downsample",
+        dest="downsample",
+        action="store_false",
+        help="Do not downsample images.",
+    )
+    parser.set_defaults(downsample=True)
+
+    args = parser.parse_args()
+    main(args)
