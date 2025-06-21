@@ -20,8 +20,14 @@ from .region import (
     SpatialRefs,
 )
 from .layers import QuantizedLinear
+from .lora import variant_state_dict
 from .utils import remove_outlier_points
 
+ImageEncodingSettings = TypedDict(
+    "ImageEncodingSettings",
+    {"variant": str},
+    total=False,
+)
 
 TextSamplingSettings = TypedDict(
     "TextSamplingSettings",
@@ -29,13 +35,14 @@ TextSamplingSettings = TypedDict(
         "max_tokens": int,
         "temperature": float,
         "top_p": float,
+        "variant": str,
     },
     total=False,
 )
 
 ObjectSamplingSettings = TypedDict(
     "ObjectSamplingSettings",
-    {"max_objects": int},
+    {"max_objects": int, "variant": str},
     total=False,
 )
 
@@ -164,13 +171,23 @@ class MoondreamModel(nn.Module):
     def _vis_proj(self, g: torch.Tensor, r: torch.Tensor):
         return vision_projection(g, r, self.vision, self.config.vision)
 
-    def _prefill(self, x: torch.Tensor, attn_mask: torch.Tensor, pos_ids: torch.Tensor):
-        return text_decoder(x, self.text, attn_mask, pos_ids, self.config.text)
+    def _prefill(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor,
+        pos_ids: torch.Tensor,
+        lora: Optional[torch.Tensor],
+    ):
+        return text_decoder(x, self.text, attn_mask, pos_ids, self.config.text, lora)
 
     def _decode_one_tok(
-        self, x: torch.Tensor, attn_mask: torch.Tensor, pos_ids: torch.Tensor
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor,
+        pos_ids: torch.Tensor,
+        lora: Optional[torch.Tensor],
     ):
-        hidden = text_decoder(x, self.text, attn_mask, pos_ids, self.config.text)
+        hidden = text_decoder(x, self.text, attn_mask, pos_ids, self.config.text, lora)
         logits = lm_head(hidden, self.text)
         return logits, hidden
 
@@ -210,11 +227,21 @@ class MoondreamModel(nn.Module):
 
         return self._vis_proj(global_features, reconstructed)
 
-    def encode_image(self, image: Union[Image.Image, EncodedImage]) -> EncodedImage:
+    def encode_image(
+        self,
+        image: Union[Image.Image, EncodedImage],
+        settings: Optional[ImageEncodingSettings] = None,
+    ) -> EncodedImage:
         if isinstance(image, EncodedImage):
             return image
         elif not isinstance(image, Image.Image):
             raise ValueError("image must be a PIL Image or EncodedImage")
+
+        lora = (
+            variant_state_dict(settings["variant"], device=self.device)
+            if settings is not None and settings["variant"] is not None
+            else None
+        )
 
         # Run through text model in addition to the vision encoder, to minimize
         # re-computation if multiple queries are performed on this image.
@@ -227,7 +254,7 @@ class MoondreamModel(nn.Module):
             inputs_embeds = torch.cat([bos_emb, img_emb[None]], dim=1)
             mask = self.attn_mask[:, :, 0 : inputs_embeds.size(1), :]
             pos_ids = torch.arange(inputs_embeds.size(1), dtype=torch.long)
-            self._prefill(inputs_embeds, mask, pos_ids)
+            self._prefill(inputs_embeds, mask, pos_ids, lora)
 
         return EncodedImage(
             pos=inputs_embeds.size(1),
@@ -257,6 +284,8 @@ class MoondreamModel(nn.Module):
         temperature: float,
         top_p: float,
         spatial_refs: Optional[SpatialRefs] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        lora: Optional[dict] = None,
     ):
         with torch.inference_mode():
             prompt_emb = text_encoder(prompt_tokens, self.text)
@@ -273,27 +302,143 @@ class MoondreamModel(nn.Module):
 
             torch._dynamo.mark_dynamic(prompt_emb, 1)
 
-            mask = self.attn_mask[:, :, pos : pos + prompt_emb.size(1), :]
+            if attn_mask is None:
+                attn_mask = self.attn_mask
+
+            mask = attn_mask[:, :, pos : pos + prompt_emb.size(1), :]
             pos_ids = torch.arange(pos, pos + prompt_emb.size(1), dtype=torch.long)
-            hidden = self._prefill(prompt_emb, mask, pos_ids)
-            logits = lm_head(hidden, self.text)
+            hidden_BC = self._prefill(prompt_emb, mask, pos_ids, lora)
+            logits_BV = lm_head(hidden_BC, self.text)
 
             if temperature == 0:
-                next_token = torch.argmax(logits, dim=-1).unsqueeze(1)
+                next_token = torch.argmax(logits_BV, dim=-1).unsqueeze(1)
             else:
-                probs = torch.softmax(logits / temperature, dim=-1)
+                probs = torch.softmax(logits_BV / temperature, dim=-1)
                 probs = self._apply_top_p(probs, top_p)
                 next_token = torch.multinomial(probs, num_samples=1)
 
         pos = pos + prompt_emb.size(1)
-        return logits, hidden, next_token, pos
+        return logits_BV, hidden_BC, next_token, pos
 
-    def _generate_text(
+    def _generate_reasoning(
+        self,
+        prompt_tokens,
+        pos,
+        settings: Optional[TextSamplingSettings] = None,
+        spatial_refs: Optional[SpatialRefs] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, str, List[dict]]:
+        max_tokens = (
+            settings.get("max_tokens", DEFAULT_MAX_TOKENS)
+            if settings
+            else DEFAULT_MAX_TOKENS
+        )
+        temperature = (
+            settings.get("temperature", DEFAULT_TEMPERATURE)
+            if settings
+            else DEFAULT_TEMPERATURE
+        )
+        lora = (
+            variant_state_dict(settings["variant"], device=self.device)
+            if settings is not None and "variant" in settings
+            else None
+        )
+
+        top_p = settings.get("top_p", DEFAULT_TOP_P) if settings else DEFAULT_TOP_P
+        eos_id = self.config.tokenizer.answer_id
+
+        _, last_hidden_BC, next_token, pos = self._prefill_prompt(
+            prompt_tokens,
+            pos,
+            temperature,
+            top_p,
+            spatial_refs,
+            attn_mask=attn_mask,
+            lora=lora,
+        )
+
+        text_token_chunks = [[]]
+        grounding_chunks = [[]]
+
+        mask = torch.zeros(1, 1, 2048, device=self.device, dtype=torch.bool)
+        mask[:, :, :pos] = 1
+        pos_ids = torch.tensor([pos], device=self.device, dtype=torch.long)
+        generated_tokens = 0
+
+        while (
+            next_token_id := next_token.item()
+        ) != eos_id and generated_tokens < max_tokens:
+            if (
+                next_token_id == self.config.tokenizer.start_ground_points_id
+                or next_token_id == self.config.tokenizer.end_ground_id
+            ):
+                text_token_chunks.append([])
+                grounding_chunks.append([])
+
+            text_token_chunks[-1].append(next_token_id)
+
+            with torch.inference_mode():
+                if next_token_id == self.config.tokenizer.coord_id:
+                    coord_logits = decode_coordinate(last_hidden_BC, self.region)
+                    coord = torch.argmax(coord_logits, dim=-1) / coord_logits.size(-1)
+                    grounding_chunks[-1].append(coord.item())
+
+                    next_emb = encode_coordinate(
+                        coord.to(dtype=coord_logits.dtype), self.region
+                    ).unsqueeze(0)
+                else:
+                    next_emb = text_encoder(next_token, self.text)
+
+                mask[:, :, pos], pos_ids[0] = 1, pos
+
+                logits_BV, last_hidden_BC = self._decode_one_tok(
+                    next_emb, mask, pos_ids, lora
+                )
+                logits_BV[:, self.config.tokenizer.eos_id] = float("-inf")
+                logits_BV[:, self.config.tokenizer.size_id] = float("-inf")
+
+                pos += 1
+
+                if temperature == 0:
+                    next_token = torch.argmax(logits_BV, dim=-1).unsqueeze(1)  # (1, 1)
+                else:
+                    probs = torch.softmax(logits_BV / temperature, dim=-1)  # (1, V)
+                    probs = self._apply_top_p(probs, top_p)
+                    next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
+
+                generated_tokens += 1
+
+        text_chunks = [
+            self.tokenizer.decode(chunk_tokens) for chunk_tokens in text_token_chunks
+        ]
+        text = "".join(text_chunks)
+
+        start_idx = 0
+        grounding = []
+        for text_chunk, grounding_chunk in zip(text_chunks, grounding_chunks):
+            if len(grounding_chunk) > 1:
+                points = []
+                for i in range(0, len(grounding_chunk) - (len(grounding_chunk) % 2), 2):
+                    points.append((grounding_chunk[i], grounding_chunk[i + 1]))
+                grounding.append(
+                    {
+                        "start_idx": start_idx,
+                        "end_idx": start_idx + len(text_chunk),
+                        "points": points,
+                    }
+                )
+            start_idx += len(text_chunk)
+
+        return pos, text, grounding
+
+    def _generate_answer(
         self,
         prompt_tokens: torch.Tensor,
         pos: int,
         settings: Optional[TextSamplingSettings] = None,
         spatial_refs: Optional[SpatialRefs] = None,
+        eos_id: Optional[int] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         max_tokens = (
             settings.get("max_tokens", DEFAULT_MAX_TOKENS)
@@ -306,9 +451,21 @@ class MoondreamModel(nn.Module):
             else DEFAULT_TEMPERATURE
         )
         top_p = settings.get("top_p", DEFAULT_TOP_P) if settings else DEFAULT_TOP_P
+        eos_id = eos_id if eos_id is not None else self.config.tokenizer.eos_id
+        lora = (
+            variant_state_dict(settings["variant"], device=self.device)
+            if settings is not None and "variant" in settings
+            else None
+        )
 
         _, _, next_token, pos = self._prefill_prompt(
-            prompt_tokens, pos, temperature, top_p, spatial_refs
+            prompt_tokens,
+            pos,
+            temperature,
+            top_p,
+            spatial_refs,
+            attn_mask=attn_mask,
+            lora=lora,
         )
 
         def generator(next_token, pos):
@@ -323,7 +480,7 @@ class MoondreamModel(nn.Module):
 
             while (
                 next_token_id := next_token.item()
-            ) != self.config.tokenizer.eos_id and generated_tokens < max_tokens:
+            ) != eos_id and generated_tokens < max_tokens:
                 # Add token to our cache
                 token_cache.append(next_token_id)
 
@@ -343,7 +500,7 @@ class MoondreamModel(nn.Module):
                     print_len += len(printable_text)
                     if printable_text:
                         yield printable_text
-                # Otherwise, only print up to the last space to avoid cutting words
+                # Otherwise, only yield up to the last space to avoid cutting words
                 else:
                     last_space_idx = text.rfind(" ", print_len)
                     if last_space_idx >= print_len:
@@ -355,13 +512,18 @@ class MoondreamModel(nn.Module):
                 with torch.inference_mode():
                     next_emb = text_encoder(next_token, self.text)
                     mask[:, :, pos], pos_ids[0] = 1, pos
-                    logits, _ = self._decode_one_tok(next_emb, mask, pos_ids)
+
+                    logits_BV, _ = self._decode_one_tok(next_emb, mask, pos_ids, lora)
+                    logits_BV[:, self.config.tokenizer.answer_id] = float("-inf")
+
                     pos += 1
 
                     if temperature == 0:
-                        next_token = torch.argmax(logits, dim=-1).unsqueeze(1)  # (1, 1)
+                        next_token = torch.argmax(logits_BV, dim=-1).unsqueeze(
+                            1
+                        )  # (1, 1)
                     else:
-                        probs = torch.softmax(logits / temperature, dim=-1)  # (1, V)
+                        probs = torch.softmax(logits_BV / temperature, dim=-1)  # (1, V)
                         probs = self._apply_top_p(probs, top_p)
                         next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
 
@@ -378,8 +540,9 @@ class MoondreamModel(nn.Module):
 
     def query(
         self,
-        image: Union[Image.Image, EncodedImage],
-        question: str,
+        image: Optional[Union[Image.Image, EncodedImage]] = None,
+        question: str = None,
+        reasoning: bool = False,
         spatial_refs: Optional[SpatialRefs] = None,
         stream: bool = False,
         settings: Optional[TextSamplingSettings] = None,
@@ -387,8 +550,28 @@ class MoondreamModel(nn.Module):
         if self.config.tokenizer.templates["query"] is None:
             raise NotImplementedError("Model does not support querying.")
 
-        image = self.encode_image(image)
-        self.load_encoded_image(image)
+        if question is None:
+            raise ValueError("question must be provided.")
+
+        if spatial_refs and image is None:
+            raise ValueError("spatial_refs can only be used with an image.")
+
+        attn_mask = self.attn_mask
+        if image is not None:
+            image = self.encode_image(image, settings)
+            self.load_encoded_image(image)
+            pos = image.pos
+            prompt_toks = self.config.tokenizer.templates["query"]["prefix"]
+        else:
+            self._setup_caches()
+            pos = 0
+            prompt_toks = [
+                self.config.tokenizer.bos_id
+            ] + self.config.tokenizer.templates["query"]["prefix"]
+            max_context = self.config.text.max_context
+            attn_mask = torch.tril(
+                torch.ones(1, 1, max_context, max_context, dtype=torch.bool)
+            ).to(self.device)
 
         spatial_toks = []
         if spatial_refs:
@@ -400,26 +583,39 @@ class MoondreamModel(nn.Module):
                 else:
                     spatial_toks.extend([coord_id, coord_id, size_id])
 
-        prompt_tokens = torch.tensor(
-            [
-                self.config.tokenizer.templates["query"]["prefix"]
-                + spatial_toks
-                + self.tokenizer.encode(question).ids
-                + self.config.tokenizer.templates["query"]["suffix"]
-            ],
-            device=self.device,
-        )
+        prompt_tokens = [
+            prompt_toks
+            + spatial_toks
+            + self.tokenizer.encode(question).ids
+            + self.config.tokenizer.templates["query"]["suffix"]
+        ]
+
+        if reasoning:
+            prompt_tokens[0] += [self.config.tokenizer.thinking_id]
+            prompt_tokens = torch.tensor(prompt_tokens, device=self.device)
+            pos, reasoning_text, reasoning_grounding = self._generate_reasoning(
+                prompt_tokens, pos, settings, spatial_refs, attn_mask=attn_mask
+            )
+            prompt_tokens = [self.config.tokenizer.templates["query"]["suffix"]]
+            reasoning_dict = {
+                "reasoning": {"text": reasoning_text, "grounding": reasoning_grounding}
+            }
+        else:
+            prompt_tokens[0] += self.config.tokenizer.templates["query"]["suffix"]
+            reasoning_dict = {}
+
+        prompt_tokens = torch.tensor(prompt_tokens, device=self.device)
 
         def generator():
-            for token in self._generate_text(
-                prompt_tokens, image.pos, settings, spatial_refs
+            for token in self._generate_answer(
+                prompt_tokens, pos, settings, spatial_refs, attn_mask=attn_mask
             ):
                 yield token
 
         if stream:
-            return {"answer": generator()}
+            return {**reasoning_dict, "answer": generator()}
         else:
-            return {"answer": "".join(list(generator()))}
+            return {**reasoning_dict, "answer": "".join(list(generator()))}
 
     def load_encoded_image(self, encoded_image: EncodedImage):
         for b, (k, v) in zip(self.text.blocks, encoded_image.caches):
@@ -438,7 +634,7 @@ class MoondreamModel(nn.Module):
         if length not in self.config.tokenizer.templates["caption"]:
             raise ValueError(f"Model does not support caption length '{length}'.")
 
-        image = self.encode_image(image)
+        image = self.encode_image(image, settings)
         self.load_encoded_image(image)
 
         prompt_tokens = torch.tensor(
@@ -446,7 +642,7 @@ class MoondreamModel(nn.Module):
         )
 
         def generator():
-            for token in self._generate_text(prompt_tokens, image.pos, settings):
+            for token in self._generate_answer(prompt_tokens, image.pos, settings):
                 yield token
 
         if stream:
@@ -461,6 +657,7 @@ class MoondreamModel(nn.Module):
         pos: int,
         include_size: bool = True,
         max_objects: int = DEFAULT_MAX_OBJECTS,
+        lora: Optional[dict] = None,
     ):
         out = []
         mask = torch.zeros(1, 1, 2048, device=self.device, dtype=torch.bool)
@@ -480,7 +677,7 @@ class MoondreamModel(nn.Module):
 
                 # Decode y-coordinate
                 mask[:, :, pos], pos_ids[0] = 1, pos
-                _, hidden = self._decode_one_tok(next_emb, mask, pos_ids)
+                _, hidden = self._decode_one_tok(next_emb, mask, pos_ids, lora)
                 pos += 1
                 y_logits = decode_coordinate(hidden, self.region)
                 y_center = torch.argmax(y_logits, dim=-1) / y_logits.size(-1)
@@ -491,7 +688,7 @@ class MoondreamModel(nn.Module):
                 # Decode size
                 if include_size:
                     mask[:, :, pos], pos_ids[0] = 1, pos
-                    logits, hidden = self._decode_one_tok(next_emb, mask, pos_ids)
+                    logits, hidden = self._decode_one_tok(next_emb, mask, pos_ids, lora)
                     pos += 1
                     size_logits = decode_size(hidden, self.region)
 
@@ -529,7 +726,7 @@ class MoondreamModel(nn.Module):
 
                 # Decode next token (x-coordinate, or eos)
                 mask[:, :, pos], pos_ids[0] = 1, pos
-                logits, hidden = self._decode_one_tok(next_emb, mask, pos_ids)
+                logits, hidden = self._decode_one_tok(next_emb, mask, pos_ids, lora)
                 pos += 1
                 next_token = torch.argmax(logits, dim=-1)
 
@@ -544,7 +741,7 @@ class MoondreamModel(nn.Module):
         if self.config.tokenizer.templates["detect"] is None:
             raise NotImplementedError("Model does not support object detection.")
 
-        image = self.encode_image(image)
+        image = self.encode_image(image, settings)
         self.load_encoded_image(image)
 
         prompt_tokens = torch.tensor(
@@ -556,8 +753,14 @@ class MoondreamModel(nn.Module):
             device=self.device,
         )
 
+        lora = (
+            variant_state_dict(settings["variant"], device=self.device)
+            if settings is not None and "variant" in settings
+            else None
+        )
+
         _, hidden, next_token, pos = self._prefill_prompt(
-            prompt_tokens, image.pos, temperature=0, top_p=0
+            prompt_tokens, image.pos, temperature=0, top_p=0, lora=lora
         )
         hidden = hidden[:, -1:, :]
 
@@ -567,7 +770,12 @@ class MoondreamModel(nn.Module):
             else DEFAULT_MAX_OBJECTS
         )
         objects = self._generate_points(
-            hidden, next_token, pos, include_size=True, max_objects=max_objects
+            hidden,
+            next_token,
+            pos,
+            include_size=True,
+            max_objects=max_objects,
+            lora=lora,
         )
 
         return {"objects": objects}
@@ -581,7 +789,7 @@ class MoondreamModel(nn.Module):
         if self.config.tokenizer.templates["point"] is None:
             raise NotImplementedError("Model does not support pointing.")
 
-        image = self.encode_image(image)
+        image = self.encode_image(image, settings)
         self.load_encoded_image(image)
 
         prompt_tokens = torch.tensor(
@@ -593,8 +801,14 @@ class MoondreamModel(nn.Module):
             device=self.device,
         )
 
+        lora = (
+            variant_state_dict(settings["variant"], device=self.device)
+            if settings is not None and "variant" in settings
+            else None
+        )
+
         _, hidden, next_token, pos = self._prefill_prompt(
-            prompt_tokens, image.pos, temperature=0, top_p=0
+            prompt_tokens, image.pos, temperature=0, top_p=0, lora=lora
         )
         hidden = hidden[:, -1:, :]
 
@@ -604,7 +818,12 @@ class MoondreamModel(nn.Module):
             else DEFAULT_MAX_OBJECTS
         )
         objects = self._generate_points(
-            hidden, next_token, pos, include_size=False, max_objects=max_objects
+            hidden,
+            next_token,
+            pos,
+            include_size=False,
+            max_objects=max_objects,
+            lora=lora,
         )
 
         return {"points": objects}
@@ -645,7 +864,7 @@ class MoondreamModel(nn.Module):
             pos_ids = torch.arange(
                 image.pos, image.pos + prompt_emb.size(1), dtype=torch.long
             )
-            hidden = self._prefill(prompt_emb, mask, pos_ids)
+            hidden = self._prefill(prompt_emb, mask, pos_ids, lora=None)
             logits = lm_head(hidden, self.text)
             next_token = torch.argmax(logits, dim=-1)
             pos = image.pos + prompt_emb.size(1)
