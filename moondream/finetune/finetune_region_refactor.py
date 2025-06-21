@@ -3,11 +3,9 @@ Roadmap for updates:
 
 - Add image augmentation / label augmentation
 - Add a validation and test set
-
+- Fine tune on vision encoder
 - Look into why saving the model does not work
-
 - Try to implement batch processing with dataloaders
-
 - Get more data / use other sources
 - Combined datasets?
 """

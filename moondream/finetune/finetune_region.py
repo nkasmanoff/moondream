@@ -28,8 +28,8 @@ from ..torch.region import (
 # This is a intended to be a basic starting point. Your optimal hyperparams and data may be different.
 MODEL_PATH = "models/moondream_base.safetensors"  # TODO: Switch to https://huggingface.co/vikhyatk/moondream2/blob/2025-01-09/model.safetensors
 # wget https://huggingface.co/vikhyatk/moondream2/resolve/2025-01-09/model.safetensors . But use starmie or default tokenizer?
-LR = 4e-3
-EPOCHS = 5
+LR = 3e-4
+EPOCHS = 100
 GRAD_ACCUM_STEPS = 1
 PLOT_PROGRESS = True
 USE_HUGGINGFACE = True
@@ -73,22 +73,15 @@ def region_loss(
 
 
 class ObjectDetection(Dataset):
-    def __init__(self, split: str = "train", downsample: bool = False):
+    def __init__(self, split: str = "train", downsample: bool = False, overfit_batch: bool = True):
         self.dataset: datasets.Dataset = datasets.load_dataset(
-            "nkasmanoff/retail_detector", split=split
+            "nkasmanoff/retail_detector_flattened", split=split
         )
         self.dataset = self.dataset.shuffle(seed=420)
-        self.shuffle_labels()
+        if overfit_batch:
+            # take a single row from dataset
+            self.dataset = self.dataset.select([0])
         self.downsample = downsample
-
-    def shuffle_labels(self):
-        # larger dataset. Each instance is one image, one label, one box.
-        for i in range(len(self.dataset)):
-            row = self.dataset[i]
-            boxes = row["boxes"]
-            labels = row["labels"]
-            self.dataset[i]["boxes"] = boxes[torch.randperm(len(boxes))]
-            self.dataset[i]["labels"] = labels[torch.randperm(len(labels))]
 
     def __len__(self):
         return len(self.dataset)
@@ -192,6 +185,34 @@ def main():
                         objects = model.detect(
                             sample["image"], sample["class_names"][0]
                         )
+                        true_objects = sample["boxes"].cpu().numpy()
+                    for obj in true_objects:
+                        x = obj[0] * img_width
+                        y = obj[1] * img_height
+                        w = obj[2] * img_width
+                        h = obj[3] * img_height
+
+                        # Draw true bounding box
+                        rect = Rectangle(
+                            (x, y),
+                            w,
+                            h,
+                            linewidth=1,
+                            edgecolor="g",
+                            facecolor="none",
+                        )
+                        ax.add_patch(rect)
+                        # Add class name text
+                        ax.text(
+                            x,
+                            y,
+                            sample["class_names"][0],
+                            color="g",
+                            fontsize=12,
+                            bbox=dict(
+                                facecolor="white", alpha=0.5, edgecolor="none", pad=1
+                            ),
+                        )
 
                     for obj in objects["objects"]:
                         x_min = obj["x_min"] * img_width
@@ -204,7 +225,7 @@ def main():
                             (x_min, y_min),
                             x_max - x_min,
                             y_max - y_min,
-                            linewidth=1,
+                            linewidth=3,
                             edgecolor="r",
                             facecolor="none",
                         )
