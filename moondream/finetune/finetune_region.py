@@ -27,14 +27,15 @@ from .region_finetune_utils import plot_progress_images
 
 
 # This is a intended to be a basic starting point. Your optimal hyperparams and data may be different.
+RANDOM_SEED = 25
 MODEL_PATH = ""
-LR = 3e-4
-EPOCHS = 100
-GRAD_ACCUM_STEPS = 4
+LR = 9e-5  # Learning rate
+EPOCHS = 50
+GRAD_ACCUM_STEPS = 1
 PLOT_PROGRESS = True
 USE_HUGGINGFACE = True
-
-
+REVISION = "2025-01-09" #"2025-04-14"
+DATASET_NAME = "nkasmanoff/retail_detector_flattened" #"nkasmanoff/retail_detector_flattened"
 def lr_schedule(step, max_steps):
     x = step / max_steps
     if x < 0.1:
@@ -55,7 +56,32 @@ def region_loss(
     c_idx = c_idx - 1
     c_hidden = hidden_states[:, c_idx, :]
     c_logits = decode_coordinate(c_hidden, w)
-    c_labels = labels[(l_idx % 4) < 2]
+    # get argmax for c_logits
+    print("C Logits Shape: ", c_logits.shape)
+    predicted_c_labels = []
+    for i in range(c_logits.size(0)):
+        predicted_c_labels.append(
+            torch.argmax(c_logits[i], dim=-1).cpu().numpy().tolist()
+        )
+    print("Predicted C Labels: ", predicted_c_labels)
+
+    x_logits = c_logits[:, 0::6]
+    y_logits = c_logits[:, 1::6]
+
+    x_pred_center = torch.argmax(x_logits, dim=-1) / x_logits.size(-1)
+    y_pred_center = torch.argmax(y_logits, dim=-1) / y_logits.size(-1)
+    print("X Center: ", x_pred_center)
+    print("Y Center: ", y_pred_center)
+
+
+    c_labels = labels[(l_idx % 4) < 2] # coordinate labels are first two elements of each box
+    x_true_center = c_labels[0::6] / 1023.0
+    y_true_center = c_labels[1::6] / 1023.0
+    print("X True Center: ", x_true_center)
+    print("Y True Center: ", y_true_center)
+    # calculate loss based on x and y centers
+    x_loss = F.mse_loss(x_pred_center, x_true_center)
+    y_loss = F.mse_loss(y_pred_center, y_true_center)
 
     c_loss = F.cross_entropy(
         c_logits.view(-1, c_logits.size(-1)),
@@ -69,7 +95,7 @@ def region_loss(
 
     s_loss = F.cross_entropy(s_logits, s_labels)
 
-    return c_loss + s_loss
+    return c_loss + s_loss + x_loss + y_loss
 
 
 class ObjectDetection(Dataset):
@@ -77,9 +103,9 @@ class ObjectDetection(Dataset):
         self, split: str = "train", downsample: bool = False, overfit_batch: bool = True
     ):
         self.dataset: datasets.Dataset = datasets.load_dataset(
-            "nkasmanoff/retail_detector_flattened", split=split
+            DATASET_NAME, split=split
         )
-        self.dataset = self.dataset.shuffle(seed=420)
+        self.dataset = self.dataset.shuffle(seed=RANDOM_SEED)
         if overfit_batch:
             # take a single row from dataset
             self.dataset = self.dataset.select([0])
@@ -144,7 +170,7 @@ def main():
     else:
         hf_model = AutoModelForCausalLM.from_pretrained(
             "vikhyatk/moondream2",
-            revision="2025-01-09",
+            revision=REVISION, # later revisions fail with  AttributeError: 'ModuleDict' object has no attribute 'kv_cache'
             trust_remote_code=True,  # Uncomment for GPU acceleration & pip install accelerate #
             device_map={"": "cuda"},
         )
@@ -152,7 +178,7 @@ def main():
 
     # If you are struggling with GPU memory, try AdamW8Bit
     optimizer = AdamW(
-        [{"params": model.region.parameters()}],
+        [{"params": model.parameters()}],
         lr=LR,
         betas=(0.9, 0.95),
         eps=1e-6,
@@ -268,6 +294,7 @@ def main():
                     labels=torch.tensor(cs_labels, dtype=torch.int64),
                     c_idx=c_idx,
                     s_idx=s_idx,
+
                 )
                 total_loss += loss
 
@@ -293,19 +320,20 @@ def main():
     wandb.finish()
 
     # Replace with your desired output location.
-    save_file(
-        model.state_dict(),
-        "moondream_finetune_nk.safetensors",
-    )
+    if not USE_HUGGINGFACE:
+        save_file(
+            model.state_dict(),
+            "moondream_finetune_nk.safetensors",
+        )
 
     if USE_HUGGINGFACE:
-        hf_model.save_pretrained(
-            "moondream_finetune_nk_hf"
+        hf_model.push_to_hub(
+            "nkasmanoff/moondream_finetune_nk_hf"
         )  # save this some other way...
         tokenizer = AutoTokenizer.from_pretrained(
-            "vikhyatk/moondream2", revision="2025-01-09", trust_remote_code=True
+            "vikhyatk/moondream2", revision=REVISION, trust_remote_code=True
         )
-        tokenizer.save_pretrained("moondream_finetune_nk_hf")
+        tokenizer.push_to_hub("nkasmanoff/moondream_finetune_nk_hf")
 
 
 if __name__ == "__main__":

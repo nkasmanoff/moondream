@@ -14,6 +14,7 @@ def plot_progress_images(epoch, val_dataset, model, use_huggingface):
 
     for sample_idx, sample in enumerate(val_dataset):
         img_width, img_height = sample["image"].size  # PIL: (width, height)
+
         if len(sample["class_names"]) == 0 or len(sample["boxes"]) == 0:
             continue
 
@@ -30,8 +31,13 @@ def plot_progress_images(epoch, val_dataset, model, use_huggingface):
         for obj in true_objects:
             x = obj[0] * img_width
             y = obj[1] * img_height
+
             w = obj[2] * img_width
             h = obj[3] * img_height
+
+            # Adjust coordinates for bounding box
+            x = x - w / 2
+            y = y - h / 2
 
             # Draw true bounding box
             rect = Rectangle(
@@ -54,18 +60,16 @@ def plot_progress_images(epoch, val_dataset, model, use_huggingface):
             )
 
         for obj in objects["objects"]:
-            x_min = obj["x_min"] * img_width
-            y_min = obj["y_min"] * img_height
-            x_max = obj["x_max"] * img_width
-            y_max = obj["y_max"] * img_height
-            x_center = (x_min + x_max) / 2
-            y_center = (y_min + y_max) / 2
+            x_min = max(obj["x_min"] * img_width, 0)
+            y_min = max(obj["y_min"] * img_height, 0)
+            x_max = min(obj["x_max"] * img_width, img_width)
+            y_max = min(obj["y_max"] * img_height, img_height)
             width = x_max - x_min
             height = y_max - y_min
 
             # Draw bounding box
             rect = Rectangle(
-                (x_center, y_center),
+                (x_min, y_min),
                 width,
                 height,
                 linewidth=3,
