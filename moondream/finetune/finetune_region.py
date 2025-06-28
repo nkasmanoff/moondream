@@ -27,21 +27,80 @@ from .region_finetune_utils import plot_progress_images
 
 
 # This is a intended to be a basic starting point. Your optimal hyperparams and data may be different.
-RANDOM_SEED = 25
+RANDOM_SEED = 250
 MODEL_PATH = ""
-LR = 9e-5  # Learning rate
+#LR = 3e-4  # Learning rate
+LR = 9e-5
+
 EPOCHS = 50
 GRAD_ACCUM_STEPS = 1
 PLOT_PROGRESS = True
 USE_HUGGINGFACE = True
-REVISION = "2025-01-09" #"2025-04-14"
-DATASET_NAME = "nkasmanoff/retail_detector_flattened" #"nkasmanoff/retail_detector_flattened"
+#REVISION = "2025-01-09"  # "2025-04-14"
+REVISION="2025-06-21"
+DATASET_NAME = (
+    "nkasmanoff/retail_detector_flattened"  # "nkasmanoff/retail_detector_flattened"
+)
+
+
 def lr_schedule(step, max_steps):
     x = step / max_steps
     if x < 0.1:
         return 0.1 * LR + 0.9 * LR * x / 0.1
     else:
         return 0.1 * LR + 0.9 * LR * (1 + math.cos(math.pi * (x - 0.1))) / 2
+
+
+def ciou_loss(boxes1, boxes2, eps=1e-7):
+    """
+    Calculate Complete Intersection over Union (CIoU) loss.
+    boxes1, boxes2: [N, 4] tensors with format (x_center, y_center, width, height)
+    """
+    # Convert boxes to (x1, y1, x2, y2)
+    b1_x1, b1_y1 = boxes1[:, 0] - boxes1[:, 2] / 2, boxes1[:, 1] - boxes1[:, 3] / 2
+    b1_x2, b1_y2 = boxes1[:, 0] + boxes1[:, 2] / 2, boxes1[:, 1] + boxes1[:, 3] / 2
+    b2_x1, b2_y1 = boxes2[:, 0] - boxes2[:, 2] / 2, boxes2[:, 1] - boxes2[:, 3] / 2
+    b2_x2, b2_y2 = boxes2[:, 0] + boxes2[:, 2] / 2, boxes2[:, 1] + boxes2[:, 3] / 2
+
+    # Intersection area
+    inter_x1 = torch.max(b1_x1, b2_x1)
+    inter_y1 = torch.max(b1_y1, b2_y1)
+    inter_x2 = torch.min(b1_x2, b2_x2)
+    inter_y2 = torch.min(b1_y2, b2_y2)
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(
+        inter_y2 - inter_y1, min=0
+    )
+
+    # Union area
+    b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+    b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+    union_area = b1_area + b2_area - inter_area + eps
+
+    # IoU
+    iou = inter_area / union_area
+
+    # Distance penalty
+    center_dist = torch.sum((boxes1[:, :2] - boxes2[:, :2]) ** 2, dim=-1)
+    enclosing_x1 = torch.min(b1_x1, b2_x1)
+    enclosing_y1 = torch.min(b1_y1, b2_y1)
+    enclosing_x2 = torch.max(b1_x2, b2_x2)
+    enclosing_y2 = torch.max(b1_y2, b2_y2)
+    enclosing_diag = (enclosing_x2 - enclosing_x1) ** 2 + (
+        enclosing_y2 - enclosing_y1
+    ) ** 2
+    distance_penalty = center_dist / (enclosing_diag + eps)
+
+    # Aspect ratio penalty
+    v = (4 / math.pi**2) * torch.pow(
+        torch.atan(boxes1[:, 2] / (boxes1[:, 3] + eps))
+        - torch.atan(boxes2[:, 2] / (boxes2[:, 3] + eps)),
+        2,
+    )
+    with torch.no_grad():
+        alpha = v / ((1 - iou) + v + eps)
+    aspect_ratio_penalty = alpha * v
+
+    return torch.mean(1 - iou + distance_penalty + aspect_ratio_penalty)
 
 
 def region_loss(
@@ -56,32 +115,8 @@ def region_loss(
     c_idx = c_idx - 1
     c_hidden = hidden_states[:, c_idx, :]
     c_logits = decode_coordinate(c_hidden, w)
-    # get argmax for c_logits
-    print("C Logits Shape: ", c_logits.shape)
-    predicted_c_labels = []
-    for i in range(c_logits.size(0)):
-        predicted_c_labels.append(
-            torch.argmax(c_logits[i], dim=-1).cpu().numpy().tolist()
-        )
-    print("Predicted C Labels: ", predicted_c_labels)
-
-    x_logits = c_logits[:, 0::6]
-    y_logits = c_logits[:, 1::6]
-
-    x_pred_center = torch.argmax(x_logits, dim=-1) / x_logits.size(-1)
-    y_pred_center = torch.argmax(y_logits, dim=-1) / y_logits.size(-1)
-    print("X Center: ", x_pred_center)
-    print("Y Center: ", y_pred_center)
-
-
-    c_labels = labels[(l_idx % 4) < 2] # coordinate labels are first two elements of each box
-    x_true_center = c_labels[0::6] / 1023.0
-    y_true_center = c_labels[1::6] / 1023.0
-    print("X True Center: ", x_true_center)
-    print("Y True Center: ", y_true_center)
-    # calculate loss based on x and y centers
-    x_loss = F.mse_loss(x_pred_center, x_true_center)
-    y_loss = F.mse_loss(y_pred_center, y_true_center)
+    c_labels = labels[(l_idx % 4) < 2]
+    print("c_labels", c_labels)
 
     c_loss = F.cross_entropy(
         c_logits.view(-1, c_logits.size(-1)),
@@ -95,7 +130,8 @@ def region_loss(
 
     s_loss = F.cross_entropy(s_logits, s_labels)
 
-    return c_loss + s_loss + x_loss + y_loss
+    return c_loss + s_loss
+
 
 
 class ObjectDetection(Dataset):
@@ -120,8 +156,8 @@ class ObjectDetection(Dataset):
         if self.downsample:
             image = image.resize((image.width // 2, image.height // 2))
 
-        boxes = row["boxes"]
-        labels = row["labels"]
+        boxes = row["boxes"][:1]
+        labels = row["labels"][:1]
 
         objects = {}
         for box, label in zip(boxes, labels):
@@ -170,7 +206,7 @@ def main():
     else:
         hf_model = AutoModelForCausalLM.from_pretrained(
             "vikhyatk/moondream2",
-            revision=REVISION, # later revisions fail with  AttributeError: 'ModuleDict' object has no attribute 'kv_cache'
+            revision=REVISION,  # later revisions fail with  AttributeError: 'ModuleDict' object has no attribute 'kv_cache'
             trust_remote_code=True,  # Uncomment for GPU acceleration & pip install accelerate #
             device_map={"": "cuda"},
         )
@@ -193,7 +229,9 @@ def main():
     i = 0
     for epoch in range(EPOCHS):
         if PLOT_PROGRESS:
-            plot_progress_images(epoch, val_dataset, model, USE_HUGGINGFACE)
+            model.eval();
+            plot_progress_images(epoch, val_dataset, hf_model, USE_HUGGINGFACE)
+        model.train();
         for sample in train_dataset:
             if len(sample["class_names"]) == 0 or len(sample["boxes"]) == 0:
                 continue
@@ -220,6 +258,7 @@ def main():
             total_loss = 0.0
             for class_name, boxes_list in boxes_by_class.items():
                 with torch.no_grad():
+                    print(f"Processing class: {class_name}")
                     instruction = f"\n\nDetect: {class_name}\n\n"
                     instruction_tokens = model.tokenizer.encode(instruction).ids
                     instruction_emb = text_encoder(
@@ -232,7 +271,7 @@ def main():
                 c_idx = []
                 s_idx = []
                 for bb in boxes_list:
-                    # bb = bb.to(dtype=torch.bfloat16, device=model.device)
+                    bb = bb.to(dtype=torch.bfloat16, device=model.device)
                     l_cs = len(cs_emb)
                     cs_emb.extend(
                         [
@@ -263,17 +302,9 @@ def main():
                     # Combine coordinate and size bin labels
                     cs_labels.extend(coord_labels + s_log2_bins)
 
-                if len(cs_emb) == 0:
-                    bb = torch.zeros(4, device=model.device).to(dtype=torch.bfloat16)
-                    cs_emb = [
-                        encode_coordinate(bb[0].unsqueeze(0), model.region),
-                        encode_coordinate(bb[1].unsqueeze(0), model.region),
-                        encode_size(bb[2:4], model.region),
-                    ]
-                    cs_labels = [0, 0, 0, 0, 0, 0]
-                    c_idx = [0, 1, 2, 3]
-                    s_idx = [4, 5]
 
+                if len(cs_emb) == 0:
+                    continue
                 cs_emb = torch.stack(cs_emb)
 
                 inputs_embeds = torch.cat(
@@ -294,9 +325,11 @@ def main():
                     labels=torch.tensor(cs_labels, dtype=torch.int64),
                     c_idx=c_idx,
                     s_idx=s_idx,
-
                 )
                 total_loss += loss
+
+            if total_loss == 0.0:
+                continue
 
             total_loss.backward()
 
